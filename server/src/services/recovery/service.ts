@@ -544,6 +544,7 @@ export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 export const PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS = 5;
 const PROVIDER_QUOTA_MONITOR_BASE_BACKOFF_MS = 15 * 60 * 1000;
 const PROVIDER_QUOTA_MONITOR_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
+const ISSUE_MONITOR_MAX_ATTEMPTS_LIMIT = 100;
 
 export function providerQuotaMonitorBackoffMs(attemptCount: number) {
   const exponent = Math.max(0, Math.floor(attemptCount));
@@ -555,6 +556,58 @@ export function providerQuotaMonitorBackoffMs(attemptCount: number) {
 
 function providerQuotaRecoveryAttemptCount(attemptCount: number | null | undefined) {
   return Math.max(0, Math.floor(attemptCount ?? 0));
+}
+
+export type QuotaMonitorAttemptAccounting = {
+  baseline: number;
+  quotaRetries: number;
+  dispatcherMaxAttempts: number | null;
+};
+
+export function quotaMonitorAttemptAccounting(input: {
+  monitorAttemptCount: number | null | undefined;
+  serviceName: string | null;
+  monitorStatus: "scheduled" | "triggered" | "cleared" | null;
+  maxAttempts: number | null;
+  savedBaseline: number | null;
+}): QuotaMonitorAttemptAccounting {
+  const total = providerQuotaRecoveryAttemptCount(input.monitorAttemptCount);
+  const continuingQuotaEpisode =
+    input.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME &&
+    (input.monitorStatus === "scheduled" || input.monitorStatus === "triggered");
+  if (!continuingQuotaEpisode) {
+    return quotaMonitorAttemptResult(total, 0);
+  }
+  if (input.savedBaseline !== null) {
+    return quotaMonitorAttemptResult(input.savedBaseline, total - input.savedBaseline);
+  }
+  if (
+    input.maxAttempts !== null &&
+    input.maxAttempts >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS
+  ) {
+    return quotaMonitorAttemptResult(
+      input.maxAttempts - PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
+      total - (input.maxAttempts - PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS),
+    );
+  }
+  return quotaMonitorAttemptResult(0, total);
+}
+
+function quotaMonitorAttemptResult(
+  baseline: number,
+  quotaRetries: number,
+): QuotaMonitorAttemptAccounting {
+  const safeBaseline = Math.max(0, Math.floor(baseline));
+  const safeRetries = Math.max(0, Math.floor(quotaRetries));
+  const dispatcherMaxAttempts = safeBaseline + PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS;
+  return {
+    baseline: safeBaseline,
+    quotaRetries: safeRetries,
+    dispatcherMaxAttempts:
+      dispatcherMaxAttempts <= ISSUE_MONITOR_MAX_ATTEMPTS_LIMIT
+        ? dispatcherMaxAttempts
+        : null,
+  };
 }
 
 const PROVIDER_QUOTA_ERROR_RE =
@@ -2690,8 +2743,8 @@ export function recoveryService(
 
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
-    const attemptCount = providerQuotaRecoveryAttemptCount(input.issue.monitorAttemptCount);
-    if (attemptCount >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS) return null;
+    const accounting = await readProviderQuotaRetryAccounting(input.issue);
+    if (accounting.quotaRetries >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS) return null;
     return db.transaction(async (tx) => {
       const wakeup = await tx
         .insert(agentWakeupRequests)
@@ -4297,6 +4350,68 @@ export function recoveryService(
     };
   }
 
+  function readQuotaMonitorSnapshot(issue: typeof issues.$inferSelect) {
+    const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+    if (policy?.monitor) {
+      return {
+        serviceName: policy.monitor.serviceName ?? null,
+        monitorStatus: "scheduled" as const,
+        maxAttempts: policy.monitor.maxAttempts ?? null,
+      };
+    }
+    const stateMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+    const monitorStatus =
+      stateMonitor?.status === "scheduled" ||
+      stateMonitor?.status === "triggered" ||
+      stateMonitor?.status === "cleared"
+        ? stateMonitor.status
+        : null;
+    return {
+      serviceName: stateMonitor?.serviceName ?? null,
+      monitorStatus,
+      maxAttempts: stateMonitor?.maxAttempts ?? null,
+    };
+  }
+
+  async function readSavedQuotaRetryBaseline(issueId: string) {
+    const row = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.monitor_scheduled"),
+          sql`${activityLog.details}->>'source' = 'recovery.provider_quota'`,
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const details = row?.details;
+    if (!details || typeof details !== "object" || !("quotaRetryBaseline" in details)) return null;
+    const baseline = details.quotaRetryBaseline;
+    return typeof baseline === "number" && Number.isFinite(baseline) ? baseline : null;
+  }
+
+  async function readProviderQuotaRetryAccounting(issue: typeof issues.$inferSelect) {
+    const snapshot = readQuotaMonitorSnapshot(issue);
+    const continuingWithoutEncodedBaseline =
+      snapshot.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME &&
+      (snapshot.monitorStatus === "scheduled" || snapshot.monitorStatus === "triggered") &&
+      snapshot.maxAttempts === null;
+    const savedBaseline = continuingWithoutEncodedBaseline
+      ? await readSavedQuotaRetryBaseline(issue.id)
+      : null;
+    return quotaMonitorAttemptAccounting({
+      monitorAttemptCount: issue.monitorAttemptCount,
+      serviceName: snapshot.serviceName,
+      monitorStatus: snapshot.monitorStatus,
+      maxAttempts: snapshot.maxAttempts,
+      savedBaseline,
+    });
+  }
+
   async function scheduleProviderQuotaRecoveryMonitor(input: {
     issue: typeof issues.$inferSelect;
     latestRun: NonNullable<LatestIssueRun>;
@@ -4318,14 +4433,18 @@ export function recoveryService(
     const previousPolicy = normalizeIssueExecutionPolicy(
       input.issue.executionPolicy ?? null,
     );
-    const attemptCount = providerQuotaRecoveryAttemptCount(input.issue.monitorAttemptCount);
-    if (attemptCount >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS) {
-      return await exhaustProviderQuotaRecoveryMonitor(input, attemptCount, previousPolicy);
+    const accounting = await readProviderQuotaRetryAccounting(input.issue);
+    if (accounting.quotaRetries >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS) {
+      return await exhaustProviderQuotaRecoveryMonitor(
+        input,
+        accounting.quotaRetries,
+        previousPolicy,
+      );
     }
     const retryAt = new Date(
       Math.max(
         input.classification.retryAt.getTime(),
-        Date.now() + providerQuotaMonitorBackoffMs(attemptCount),
+        Date.now() + providerQuotaMonitorBackoffMs(accounting.quotaRetries),
       ),
     );
     const retryTargetDescription =
@@ -4350,7 +4469,7 @@ export function recoveryService(
         timeoutAt: new Date(
           retryAt.getTime() + PROVIDER_QUOTA_MONITOR_MAX_BACKOFF_MS,
         ).toISOString(),
-        maxAttempts: PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
+        maxAttempts: accounting.dispatcherMaxAttempts,
         recoveryPolicy: "wake_owner" as const,
       },
     };
@@ -4386,8 +4505,9 @@ export function recoveryService(
         nextCheckAt: retryAt.toISOString(),
         parsedResetTime: input.classification.parsedResetTime,
         targetAgentId,
-        attemptCount,
+        attemptCount: accounting.quotaRetries,
         maxAttempts: PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
+        quotaRetryBaseline: accounting.baseline,
       },
     });
 
@@ -4411,8 +4531,6 @@ export function recoveryService(
       commentRequired: true,
       stages: [],
     };
-    // The clear helper reads the policy passed in. An unbounded monitor would
-    // not exhaust, and an explicit update throws once the cap is reached.
     const policy = {
       ...basePolicy,
       monitor: {
