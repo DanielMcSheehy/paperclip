@@ -541,6 +541,21 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+export const PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS = 5;
+const PROVIDER_QUOTA_MONITOR_BASE_BACKOFF_MS = 15 * 60 * 1000;
+const PROVIDER_QUOTA_MONITOR_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
+
+export function providerQuotaMonitorBackoffMs(attemptCount: number) {
+  const exponent = Math.max(0, Math.floor(attemptCount));
+  return Math.min(
+    PROVIDER_QUOTA_MONITOR_MAX_BACKOFF_MS,
+    PROVIDER_QUOTA_MONITOR_BASE_BACKOFF_MS * 2 ** exponent,
+  );
+}
+
+function providerQuotaRecoveryAttemptCount(attemptCount: number | null | undefined) {
+  return Math.max(0, Math.floor(attemptCount ?? 0));
+}
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
@@ -2675,6 +2690,8 @@ export function recoveryService(
 
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
+    const attemptCount = providerQuotaRecoveryAttemptCount(input.issue.monitorAttemptCount);
+    if (attemptCount >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS) return null;
     return db.transaction(async (tx) => {
       const wakeup = await tx
         .insert(agentWakeupRequests)
@@ -4301,6 +4318,16 @@ export function recoveryService(
     const previousPolicy = normalizeIssueExecutionPolicy(
       input.issue.executionPolicy ?? null,
     );
+    const attemptCount = providerQuotaRecoveryAttemptCount(input.issue.monitorAttemptCount);
+    if (attemptCount >= PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS) {
+      return await exhaustProviderQuotaRecoveryMonitor(input, attemptCount, previousPolicy);
+    }
+    const retryAt = new Date(
+      Math.max(
+        input.classification.retryAt.getTime(),
+        Date.now() + providerQuotaMonitorBackoffMs(attemptCount),
+      ),
+    );
     const retryTargetDescription =
       input.issue.status === "in_review"
         ? "the active review participant"
@@ -4312,7 +4339,7 @@ export function recoveryService(
         stages: [],
       }),
       monitor: {
-        nextCheckAt: input.classification.retryAt.toISOString(),
+        nextCheckAt: retryAt.toISOString(),
         notes: input.classification.parsedResetTime
           ? `Provider usage quota reached; retry ${retryTargetDescription} at the provider reset time.`
           : `Provider usage quota reached; retry ${retryTargetDescription} after the default recovery backoff.`,
@@ -4320,8 +4347,10 @@ export function recoveryService(
         kind: "external_service" as const,
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
-        timeoutAt: null,
-        maxAttempts: null,
+        timeoutAt: new Date(
+          retryAt.getTime() + PROVIDER_QUOTA_MONITOR_MAX_BACKOFF_MS,
+        ).toISOString(),
+        maxAttempts: PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
         recoveryPolicy: "wake_owner" as const,
       },
     };
@@ -4354,9 +4383,92 @@ export function recoveryService(
         source: "recovery.provider_quota",
         latestRunId: input.latestRun.id,
         errorCode: "provider_quota",
-        nextCheckAt: input.classification.retryAt.toISOString(),
+        nextCheckAt: retryAt.toISOString(),
         parsedResetTime: input.classification.parsedResetTime,
         targetAgentId,
+        attemptCount,
+        maxAttempts: PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
+      },
+    });
+
+    return updated;
+  }
+
+  async function exhaustProviderQuotaRecoveryMonitor(
+    input: {
+      issue: typeof issues.$inferSelect;
+      latestRun: NonNullable<LatestIssueRun>;
+      classification: Extract<
+        NonNullable<AdapterFailureRecoveryClassification>,
+        { kind: "provider_quota" }
+      >;
+    },
+    attemptCount: number,
+    previousPolicy: ReturnType<typeof normalizeIssueExecutionPolicy>,
+  ) {
+    const basePolicy = previousPolicy ?? {
+      mode: "normal" as const,
+      commentRequired: true,
+      stages: [],
+    };
+    // The clear helper reads the policy passed in. An unbounded monitor would
+    // not exhaust, and an explicit update throws once the cap is reached.
+    const policy = {
+      ...basePolicy,
+      monitor: {
+        nextCheckAt:
+          basePolicy.monitor?.nextCheckAt ??
+          input.classification.retryAt.toISOString(),
+        notes: basePolicy.monitor?.notes ?? null,
+        scheduledBy: basePolicy.monitor?.scheduledBy ?? ("assignee" as const),
+        kind: "external_service" as const,
+        serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+        externalRef: basePolicy.monitor?.externalRef ?? input.latestRun.id,
+        timeoutAt: null,
+        maxAttempts: PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
+        recoveryPolicy: "wake_owner" as const,
+      },
+    };
+    const transition = applyIssueMonitorPolicyTransition({
+      issue: input.issue,
+      policy,
+      previousPolicy,
+      requestedStatus: input.issue.status,
+      requestedAssigneePatch: {},
+      actor: { agentId: null, userId: null },
+      monitorExplicitlyUpdated: false,
+    });
+    const updated = await issuesSvc.update(input.issue.id, {
+      ...transition.patch,
+      status: "blocked",
+    });
+    if (!updated) return null;
+
+    await issuesSvc.addComment(
+      input.issue.id,
+      "Paperclip stopped the provider-quota recovery monitor for this issue after " +
+        `${attemptCount} attempts (cap ${PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS}). The issue is ` +
+        "blocked pending provider quota recovery: retry it, reassign it, or resolve it " +
+        "intentionally once the provider limit resets.",
+      {},
+      { authorType: "system" },
+    );
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "recovery",
+      agentId: null,
+      runId: input.latestRun.id,
+      action: "issue.monitor_exhausted",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        source: "recovery.provider_quota",
+        clearReason: "max_attempts_exhausted",
+        attemptCount,
+        maxAttempts: PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
       },
     });
 

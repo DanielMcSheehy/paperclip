@@ -2,12 +2,27 @@ import { classifyRunLiveness } from "../run-liveness.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { describe, expect, it } from "vitest";
 import {
+  PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS,
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
   classifyAdapterFailureForRecovery,
   classifyContinuationFailure,
+  providerQuotaMonitorBackoffMs,
 } from "./service.js";
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 import { isConfigurationIncompleteFailedRun } from "../../modules/wake-queue/domain/values.js";
+
+describe("providerQuotaMonitorBackoffMs", () => {
+  it("grows from 15 minutes and stops at 6 hours", () => {
+    expect(PROVIDER_QUOTA_MONITOR_MAX_ATTEMPTS).toBe(5);
+    expect(providerQuotaMonitorBackoffMs(0)).toBe(15 * 60 * 1000);
+    expect(providerQuotaMonitorBackoffMs(1)).toBe(30 * 60 * 1000);
+    expect(providerQuotaMonitorBackoffMs(2)).toBe(60 * 60 * 1000);
+    expect(providerQuotaMonitorBackoffMs(3)).toBe(2 * 60 * 60 * 1000);
+    expect(providerQuotaMonitorBackoffMs(4)).toBe(4 * 60 * 60 * 1000);
+    expect(providerQuotaMonitorBackoffMs(5)).toBe(6 * 60 * 60 * 1000);
+    expect(providerQuotaMonitorBackoffMs(79)).toBe(6 * 60 * 60 * 1000);
+  });
+});
 
 describe("classifyAdapterFailureForRecovery", () => {
   it("waits for model configuration changes instead of retrying a typed native model rejection", () => {

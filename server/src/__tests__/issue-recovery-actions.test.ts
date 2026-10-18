@@ -939,10 +939,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       monitor: {
         serviceName: "AI provider quota",
         externalRef: runId,
-        maxAttempts: null,
+        maxAttempts: 5,
         recoveryPolicy: "wake_owner",
       },
     });
+    const armedPolicy = updatedIssue?.executionPolicy;
+    const armedMonitor = armedPolicy && typeof armedPolicy === "object" && "monitor" in armedPolicy
+      ? armedPolicy.monitor
+      : null;
+    const timeoutAt = armedMonitor && typeof armedMonitor === "object" && "timeoutAt" in armedMonitor
+      ? armedMonitor.timeoutAt
+      : null;
+    const nextCheckAt = armedMonitor && typeof armedMonitor === "object" && "nextCheckAt" in armedMonitor
+      ? armedMonitor.nextCheckAt
+      : null;
+    expect(timeoutAt).toEqual(expect.any(String));
+    expect(nextCheckAt).toEqual(expect.any(String));
+    expect(new Date(String(timeoutAt)).getTime() - new Date(String(nextCheckAt)).getTime()).toBe(6 * 60 * 60 * 1000);
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
     expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
@@ -979,10 +992,86 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(updatedIssue?.executionPolicy).toMatchObject({
       monitor: {
-        maxAttempts: null,
+        maxAttempts: 5,
         externalRef: runId,
       },
     });
+    const nextCheckAt = updatedIssue?.monitorNextCheckAt?.getTime() ?? 0;
+    expect(nextCheckAt).toBeGreaterThanOrEqual(Date.now() + 59 * 60 * 1000);
+    expect(nextCheckAt).toBeLessThanOrEqual(Date.now() + 61 * 60 * 1000);
+  });
+
+  it("stops an unbounded provider-quota monitor once the attempt cap is reached", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({
+      monitorAttemptCount: 5,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+          notes: "Provider usage quota reached; retry the original assignee after the default recovery backoff.",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "AI provider quota",
+          externalRef: randomUUID(),
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: "wake_owner",
+        },
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T22:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T22:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.providerQuotaMonitored).toBe(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: coderId,
+      monitorNextCheckAt: null,
+      monitorAttemptCount: 5,
+    });
+    expect(updatedIssue?.executionPolicy).toBeNull();
+    expect(updatedIssue?.executionState).toMatchObject({
+      monitor: {
+        status: "cleared",
+        clearReason: "max_attempts_exhausted",
+        attemptCount: 5,
+      },
+    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.some((comment) => comment.body.includes("cap 5"))).toBe(true);
+    const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
+    expect(logs).toContainEqual(expect.objectContaining({
+      action: "issue.monitor_exhausted",
+      details: expect.objectContaining({
+        source: "recovery.provider_quota",
+        clearReason: "max_attempts_exhausted",
+        attemptCount: 5,
+        maxAttempts: 5,
+      }),
+    }));
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+
+    const secondResult = await recovery.reconcileStrandedAssignedIssues();
+    expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, escalated: 0 });
   });
 
   it("skips provider-quota monitor scheduling for todo issues without aborting reconciliation", async () => {
