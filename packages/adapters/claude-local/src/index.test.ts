@@ -23,9 +23,9 @@ describe("Claude model defaults", () => {
     "claude-haiku-5-5[1m]",
     "us.anthropic.claude-haiku-5-5",
     "global.anthropic.claude-haiku-5-5[1m]",
-  ])("requires CLI 2.1.293 and offers no effort for %s", (model) => {
+  ])("requires CLI 2.1.293 and offers all efforts for %s", (model) => {
     expect(minimumClaudeCliVersionForModel(model)).toBe("2.1.293");
-    expect(claudeLocalReasoningEffortsForModel(model)).toEqual([]);
+    expect(claudeLocalReasoningEffortsForModel(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("keeps model-specific Claude reasoning limits", () => {
@@ -34,7 +34,7 @@ describe("Claude model defaults", () => {
     expect(claudeLocalReasoningEffortsForModel("claude-sonnet-4-6")).toEqual(["low", "medium", "high", "max"]);
     expect(claudeLocalReasoningEffortsForModel("claude-sonnet-4-5")).toEqual(["low", "medium", "high"]);
     expect(claudeLocalReasoningEffortsForModel("claude-haiku-4-5")).toEqual([]);
-    expect(claudeLocalReasoningEffortsForModel("claude-haiku-5-5")).toEqual([]);
+    expect(claudeLocalReasoningEffortsForModel("claude-haiku-5-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(claudeLocalReasoningEffortsForModel("custom-model")).toEqual(["low", "medium", "high"]);
   });
 
